@@ -9,6 +9,7 @@ use base qw/Class::Accessor::Lite/;
 use List::Util qw/first max min/;
 use Proc::Wait3 ();
 use Time::HiRes ();
+use Carp        ();
 
 use Class::Accessor::Lite (
     rw => [ qw/max_workers spawn_interval err_respawn_interval trap_signals signal_received manager_pid on_child_reap before_fork after_fork/ ],
@@ -19,6 +20,8 @@ our $VERSION = '0.13';
 sub new {
     my $klass = shift;
     my $opts = @_ == 1 ? $_[0] : +{ @_ };
+
+    pipe my $sigr, my $sigw or Carp::croak("Failed to pipe(2): $!");
     my $self = bless {
         worker_pids          => {},
         max_workers          => 10,
@@ -32,9 +35,11 @@ sub new {
         generation           => 0,
         %$opts,
         _no_adjust_until     => 0, # becomes undef in wait_all_children
+        signal_reader        => $sigr,
     }, $klass;
     $SIG{$_} = sub {
         $self->signal_received($_[0]);
+        syswrite $sigw, $_[0];
     } for keys %{$self->trap_signals};
     $SIG{CHLD} = sub {};
     $self;
@@ -222,8 +227,10 @@ sub _wait {
             $delayed_fork_sleep,
         );
         if (defined $sleep_secs) {
+            my $rbits = '';
+            vec($rbits, fileno($self->{signal_reader}), 1) = 1;
             # wait max sleep_secs or until signalled
-            select(undef, undef, undef, $sleep_secs);
+            select($rbits, undef, undef, $sleep_secs);
             if (my @r = Proc::Wait3::wait3(0)) {
                 return @r;
             }
